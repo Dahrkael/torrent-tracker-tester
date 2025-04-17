@@ -22,6 +22,10 @@ type Config struct {
 	Duration time.Duration
 	// Whether to print detailed logs
 	Verbose bool
+	// Size of the info_hash pool
+	InfoHashPoolSize int
+	// Size of the peer pool
+	PeerPoolSize int
 	// Parameters for announce requests
 	RequestParams RequestParams
 }
@@ -64,6 +68,14 @@ type AnnounceRequest struct {
 	Supportcryp int
 }
 
+// PeerInfo represents a BitTorrent peer
+type PeerInfo struct {
+	ID   string
+	IP   string
+	Port int
+	Key  string
+}
+
 // AnnounceResult holds the result of an announce request
 type AnnounceResult struct {
 	Success      bool
@@ -72,6 +84,7 @@ type AnnounceResult struct {
 	HTTPStatus   int
 	ErrorMessage string
 	InfoHash     string
+	PeerID       string
 }
 
 // Global variables
@@ -82,6 +95,8 @@ var (
 		TrackerURL:         "http://localhost:6969/announce",
 		Duration:           0,
 		Verbose:            true,
+		InfoHashPoolSize:   100,
+		PeerPoolSize:       50,
 		RequestParams: RequestParams{
 			MinPort:       6881,
 			MaxPort:       6889,
@@ -92,7 +107,7 @@ var (
 			MinLeft:       0,
 			MaxLeft:       1073741824, // 1 GB
 			Events:        []string{"started", "completed", "stopped", ""},
-			IPRange:       []string{"", "127.0.0.1"},
+			IPRange:       []string{"", "127.0.0.1", "192.168.1.1", "10.0.0.1"},
 			MinNumWant:    0,
 			MaxNumWant:    200,
 			MinKeyLength:  8,
@@ -110,6 +125,10 @@ var (
 
 	// Random source
 	rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	// Pools
+	infoHashPool []string
+	peerPool     []PeerInfo
 )
 
 func main() {
@@ -126,11 +145,20 @@ func main() {
 	log.Printf("Starting BitTorrent tracker announcer")
 	log.Printf("Target tracker: %s", config.TrackerURL)
 	log.Printf("Concurrent requests: %d", config.ConcurrentRequests)
+	log.Printf("Info hash pool size: %d", config.InfoHashPoolSize)
+	log.Printf("Peer pool size: %d", config.PeerPoolSize)
 	if config.Duration > 0 {
 		log.Printf("Running for: %s", config.Duration)
 	} else {
 		log.Printf("Running indefinitely (press Ctrl+C to stop)")
 	}
+
+	// Generate pools
+	generateInfoHashPool(config.InfoHashPoolSize)
+	generatePeerPool(config.PeerPoolSize, config.RequestParams)
+
+	log.Printf("Generated %d unique info_hashes", len(infoHashPool))
+	log.Printf("Generated %d unique peers", len(peerPool))
 
 	// Channel for results
 	resultsChan := make(chan AnnounceResult, config.ConcurrentRequests*2)
@@ -184,6 +212,27 @@ func main() {
 	waitForCompletion(done, stopStats, &wg)
 }
 
+// generateInfoHashPool creates a pool of random info_hashes
+func generateInfoHashPool(size int) {
+	infoHashPool = make([]string, size)
+	for i := 0; i < size; i++ {
+		infoHashPool[i] = generateRandomInfoHash()
+	}
+}
+
+// generatePeerPool creates a pool of random peers
+func generatePeerPool(size int, params RequestParams) {
+	peerPool = make([]PeerInfo, size)
+	for i := 0; i < size; i++ {
+		peerPool[i] = PeerInfo{
+			ID:   generateRandomPeerID(),
+			IP:   params.IPRange[rng.Intn(len(params.IPRange))],
+			Port: rng.Intn(params.MaxPort-params.MinPort+1) + params.MinPort,
+			Key:  generateRandomKey(params.MinKeyLength, params.MaxKeyLength),
+		}
+	}
+}
+
 // parseFlags parses command line flags and returns the configuration
 func parseFlags() Config {
 	config := defaultConfig
@@ -193,6 +242,8 @@ func parseFlags() Config {
 	flag.StringVar(&config.TrackerURL, "tracker", defaultConfig.TrackerURL, "Tracker URL")
 	durationStr := flag.String("duration", "", "Duration to run (e.g., 1m, 1h, 30s)")
 	flag.BoolVar(&config.Verbose, "verbose", defaultConfig.Verbose, "Verbose output")
+	flag.IntVar(&config.InfoHashPoolSize, "hashpool", defaultConfig.InfoHashPoolSize, "Size of the info_hash pool")
+	flag.IntVar(&config.PeerPoolSize, "peerpool", defaultConfig.PeerPoolSize, "Size of the peer pool")
 
 	// Parse flags
 	flag.Parse()
@@ -214,8 +265,8 @@ func parseFlags() Config {
 func makeAnnounceRequest(config Config, results chan<- AnnounceResult, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	// Generate a random announce request
-	req := generateRandomAnnounceRequest(config.RequestParams)
+	// Generate a random announce request using pools
+	req := generateAnnounceRequestFromPools(config.RequestParams)
 
 	// Build the request URL
 	reqURL, err := buildAnnounceURL(config.TrackerURL, req)
@@ -227,6 +278,7 @@ func makeAnnounceRequest(config Config, results chan<- AnnounceResult, wg *sync.
 			HTTPStatus:   0,
 			ErrorMessage: fmt.Sprintf("Failed to build URL: %v", err),
 			InfoHash:     req.InfoHash,
+			PeerID:       req.PeerID,
 		}
 		return
 	}
@@ -250,6 +302,7 @@ func makeAnnounceRequest(config Config, results chan<- AnnounceResult, wg *sync.
 			HTTPStatus:   0,
 			ErrorMessage: fmt.Sprintf("HTTP request failed: %v", err),
 			InfoHash:     req.InfoHash,
+			PeerID:       req.PeerID,
 		}
 		return
 	}
@@ -264,6 +317,7 @@ func makeAnnounceRequest(config Config, results chan<- AnnounceResult, wg *sync.
 			HTTPStatus:   response.StatusCode,
 			ErrorMessage: fmt.Sprintf("Non-200 status code: %d", response.StatusCode),
 			InfoHash:     req.InfoHash,
+			PeerID:       req.PeerID,
 		}
 		return
 	}
@@ -281,22 +335,29 @@ func makeAnnounceRequest(config Config, results chan<- AnnounceResult, wg *sync.
 		HTTPStatus:   response.StatusCode,
 		ErrorMessage: "",
 		InfoHash:     req.InfoHash,
+		PeerID:       req.PeerID,
 	}
 }
 
-// generateRandomAnnounceRequest creates a random announce request based on the configuration
-func generateRandomAnnounceRequest(params RequestParams) AnnounceRequest {
+// generateAnnounceRequestFromPools creates an announce request using the predefined pools
+func generateAnnounceRequestFromPools(params RequestParams) AnnounceRequest {
+	// Select a random info_hash from the pool
+	infoHash := infoHashPool[rng.Intn(len(infoHashPool))]
+
+	// Select a random peer from the pool
+	peer := peerPool[rng.Intn(len(peerPool))]
+
 	return AnnounceRequest{
-		InfoHash:    generateRandomInfoHash(),
-		PeerID:      generateRandomPeerID(),
-		Port:        rng.Intn(params.MaxPort-params.MinPort+1) + params.MinPort,
+		InfoHash:    infoHash,
+		PeerID:      peer.ID,
+		Port:        peer.Port,
 		Uploaded:    randomInt64(params.MinUploaded, params.MaxUploaded),
 		Downloaded:  randomInt64(params.MinDownloaded, params.MaxDownloaded),
 		Left:        randomInt64(params.MinLeft, params.MaxLeft),
 		Event:       params.Events[rng.Intn(len(params.Events))],
-		IP:          params.IPRange[rng.Intn(len(params.IPRange))],
+		IP:          peer.IP,
 		NumWant:     rng.Intn(params.MaxNumWant-params.MinNumWant+1) + params.MinNumWant,
-		Key:         generateRandomKey(params.MinKeyLength, params.MaxKeyLength),
+		Key:         peer.Key,
 		TrackerID:   "",
 		Compact:     1,
 		NoPeerID:    0,
@@ -406,7 +467,8 @@ func processResult(result AnnounceResult) {
 
 	// Log the result if it's a failure
 	if !result.Success {
-		log.Printf("Request failed: %s (InfoHash: %s)", result.ErrorMessage, result.InfoHash)
+		log.Printf("Request failed: %s (InfoHash: %s, PeerID: %s)",
+			result.ErrorMessage, result.InfoHash, result.PeerID)
 	}
 }
 
@@ -440,11 +502,14 @@ func printStats() {
 		avgPeers = float64(totalPeers) / float64(requestsSuccess)
 	}
 
+	var successRate float64
+	if requestsSent > 0 {
+		successRate = float64(requestsSuccess) * 100 / float64(requestsSent)
+	}
+
 	log.Printf("Statistics:")
 	log.Printf("  Requests: %d total, %d successful (%.1f%%), %d failed",
-		requestsSent, requestsSuccess,
-		float64(requestsSuccess)*100/float64(requestsSent+1),
-		requestsFailed)
+		requestsSent, requestsSuccess, successRate, requestsFailed)
 	log.Printf("  Average request time: %v", avgTime)
 	log.Printf("  Average peers per response: %.1f", avgPeers)
 }
