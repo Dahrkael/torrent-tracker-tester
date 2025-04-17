@@ -26,6 +26,8 @@ type Config struct {
 	InfoHashPoolSize int
 	// Size of the peer pool
 	PeerPoolSize int
+	// Probability of generating a seeder request (0.0-1.0)
+	SeederProbability float64
 	// Parameters for announce requests
 	RequestParams RequestParams
 }
@@ -40,7 +42,7 @@ type RequestParams struct {
 	MinDownloaded, MaxDownloaded int64
 	// Range for random bytes left
 	MinLeft, MaxLeft int64
-	// Possible event values
+	// Possible event values for non-seeders
 	Events []string
 	// Range for random IP address
 	IPRange []string
@@ -66,6 +68,7 @@ type AnnounceRequest struct {
 	Compact     int
 	NoPeerID    int
 	Supportcryp int
+	IsSeeder    bool // Flag to indicate if this is a seeder request
 }
 
 // PeerInfo represents a BitTorrent peer
@@ -85,6 +88,7 @@ type AnnounceResult struct {
 	ErrorMessage string
 	InfoHash     string
 	PeerID       string
+	IsSeeder     bool // Flag to indicate if this was a seeder request
 }
 
 // Global variables
@@ -97,6 +101,7 @@ var (
 		Verbose:            true,
 		InfoHashPoolSize:   100,
 		PeerPoolSize:       50,
+		SeederProbability:  0.3, // 30% seeders by default
 		RequestParams: RequestParams{
 			MinPort:       6881,
 			MaxPort:       6889,
@@ -119,6 +124,10 @@ var (
 	requestsSent     int
 	requestsSuccess  int
 	requestsFailed   int
+	seedersSent      int
+	seedersSuccess   int
+	leechersSent     int
+	leechersSuccess  int
 	totalRequestTime time.Duration
 	totalPeers       int
 	statsLock        sync.Mutex
@@ -147,6 +156,7 @@ func main() {
 	log.Printf("Concurrent requests: %d", config.ConcurrentRequests)
 	log.Printf("Info hash pool size: %d", config.InfoHashPoolSize)
 	log.Printf("Peer pool size: %d", config.PeerPoolSize)
+	log.Printf("Seeder probability: %.2f (%.1f%%)", config.SeederProbability, config.SeederProbability*100)
 	if config.Duration > 0 {
 		log.Printf("Running for: %s", config.Duration)
 	} else {
@@ -244,9 +254,16 @@ func parseFlags() Config {
 	flag.BoolVar(&config.Verbose, "verbose", defaultConfig.Verbose, "Verbose output")
 	flag.IntVar(&config.InfoHashPoolSize, "hashpool", defaultConfig.InfoHashPoolSize, "Size of the info_hash pool")
 	flag.IntVar(&config.PeerPoolSize, "peerpool", defaultConfig.PeerPoolSize, "Size of the peer pool")
+	flag.Float64Var(&config.SeederProbability, "seeders", defaultConfig.SeederProbability, "Probability of generating seeder requests (0.0-1.0)")
 
 	// Parse flags
 	flag.Parse()
+
+	// Validate seeder probability
+	if config.SeederProbability < 0 || config.SeederProbability > 1 {
+		fmt.Fprintf(os.Stderr, "Invalid seeder probability: %.2f (must be between 0.0 and 1.0)\n", config.SeederProbability)
+		os.Exit(1)
+	}
 
 	// Parse duration if provided
 	if *durationStr != "" {
@@ -265,8 +282,8 @@ func parseFlags() Config {
 func makeAnnounceRequest(config Config, results chan<- AnnounceResult, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	// Generate a random announce request using pools
-	req := generateAnnounceRequestFromPools(config.RequestParams)
+	// Generate a random announce request using pools, considering seeder probability
+	req := generateAnnounceRequestFromPools(config.RequestParams, config.SeederProbability)
 
 	// Build the request URL
 	reqURL, err := buildAnnounceURL(config.TrackerURL, req)
@@ -279,13 +296,18 @@ func makeAnnounceRequest(config Config, results chan<- AnnounceResult, wg *sync.
 			ErrorMessage: fmt.Sprintf("Failed to build URL: %v", err),
 			InfoHash:     req.InfoHash,
 			PeerID:       req.PeerID,
+			IsSeeder:     req.IsSeeder,
 		}
 		return
 	}
 
 	// Log the request if verbose
 	if config.Verbose {
-		log.Printf("Sending request: %s", reqURL)
+		if req.IsSeeder {
+			log.Printf("Sending seeder request: %s", reqURL)
+		} else {
+			log.Printf("Sending leecher request: %s", reqURL)
+		}
 	}
 
 	// Send the HTTP request and measure time
@@ -303,6 +325,7 @@ func makeAnnounceRequest(config Config, results chan<- AnnounceResult, wg *sync.
 			ErrorMessage: fmt.Sprintf("HTTP request failed: %v", err),
 			InfoHash:     req.InfoHash,
 			PeerID:       req.PeerID,
+			IsSeeder:     req.IsSeeder,
 		}
 		return
 	}
@@ -318,6 +341,7 @@ func makeAnnounceRequest(config Config, results chan<- AnnounceResult, wg *sync.
 			ErrorMessage: fmt.Sprintf("Non-200 status code: %d", response.StatusCode),
 			InfoHash:     req.InfoHash,
 			PeerID:       req.PeerID,
+			IsSeeder:     req.IsSeeder,
 		}
 		return
 	}
@@ -336,25 +360,48 @@ func makeAnnounceRequest(config Config, results chan<- AnnounceResult, wg *sync.
 		ErrorMessage: "",
 		InfoHash:     req.InfoHash,
 		PeerID:       req.PeerID,
+		IsSeeder:     req.IsSeeder,
 	}
 }
 
 // generateAnnounceRequestFromPools creates an announce request using the predefined pools
-func generateAnnounceRequestFromPools(params RequestParams) AnnounceRequest {
+func generateAnnounceRequestFromPools(params RequestParams, seederProb float64) AnnounceRequest {
 	// Select a random info_hash from the pool
 	infoHash := infoHashPool[rng.Intn(len(infoHashPool))]
 
 	// Select a random peer from the pool
 	peer := peerPool[rng.Intn(len(peerPool))]
 
+	// Determine if this request should be a seeder based on probability
+	isSeeder := rng.Float64() < seederProb
+
+	var left int64
+	var event string
+	var uploaded int64
+	var downloaded int64
+
+	if isSeeder {
+		// Seeders have left=0, usually no event, and potentially high upload values
+		left = 0
+		event = ""                                                             // Seeders typically don't send events after initial announcement
+		uploaded = randomInt64(params.MinUploaded, params.MaxUploaded) * 2     // Typically higher uploads for seeders
+		downloaded = randomInt64(params.MaxDownloaded/2, params.MaxDownloaded) // Downloaded is usually high (completed)
+	} else {
+		// Leechers have non-zero left and various events
+		left = randomInt64(params.MinLeft, params.MaxLeft)
+		event = params.Events[rng.Intn(len(params.Events))]
+		uploaded = randomInt64(params.MinUploaded, params.MaxUploaded)
+		downloaded = randomInt64(params.MinDownloaded, params.MaxDownloaded)
+	}
+
 	return AnnounceRequest{
 		InfoHash:    infoHash,
 		PeerID:      peer.ID,
 		Port:        peer.Port,
-		Uploaded:    randomInt64(params.MinUploaded, params.MaxUploaded),
-		Downloaded:  randomInt64(params.MinDownloaded, params.MaxDownloaded),
-		Left:        randomInt64(params.MinLeft, params.MaxLeft),
-		Event:       params.Events[rng.Intn(len(params.Events))],
+		Uploaded:    uploaded,
+		Downloaded:  downloaded,
+		Left:        left,
+		Event:       event,
 		IP:          peer.IP,
 		NumWant:     rng.Intn(params.MaxNumWant-params.MinNumWant+1) + params.MinNumWant,
 		Key:         peer.Key,
@@ -362,6 +409,7 @@ func generateAnnounceRequestFromPools(params RequestParams) AnnounceRequest {
 		Compact:     1,
 		NoPeerID:    0,
 		Supportcryp: 0,
+		IsSeeder:    isSeeder,
 	}
 }
 
@@ -457,6 +505,20 @@ func processResult(result AnnounceResult) {
 	defer statsLock.Unlock()
 
 	requestsSent++
+
+	// Update seeder/leecher counts
+	if result.IsSeeder {
+		seedersSent++
+		if result.Success {
+			seedersSuccess++
+		}
+	} else {
+		leechersSent++
+		if result.Success {
+			leechersSuccess++
+		}
+	}
+
 	if result.Success {
 		requestsSuccess++
 		totalPeers += result.PeersCount
@@ -467,8 +529,13 @@ func processResult(result AnnounceResult) {
 
 	// Log the result if it's a failure
 	if !result.Success {
-		log.Printf("Request failed: %s (InfoHash: %s, PeerID: %s)",
-			result.ErrorMessage, result.InfoHash, result.PeerID)
+		peerType := "leecher"
+		if result.IsSeeder {
+			peerType = "seeder"
+		}
+
+		log.Printf("Request failed (%s): %s (InfoHash: %s, PeerID: %s)",
+			peerType, result.ErrorMessage, result.InfoHash, result.PeerID)
 	}
 }
 
@@ -507,9 +574,28 @@ func printStats() {
 		successRate = float64(requestsSuccess) * 100 / float64(requestsSent)
 	}
 
+	var seederRate float64
+	if requestsSent > 0 {
+		seederRate = float64(seedersSent) * 100 / float64(requestsSent)
+	}
+
+	var seederSuccessRate float64
+	if seedersSent > 0 {
+		seederSuccessRate = float64(seedersSuccess) * 100 / float64(seedersSent)
+	}
+
+	var leecherSuccessRate float64
+	if leechersSent > 0 {
+		leecherSuccessRate = float64(leechersSuccess) * 100 / float64(leechersSent)
+	}
+
 	log.Printf("Statistics:")
 	log.Printf("  Requests: %d total, %d successful (%.1f%%), %d failed",
 		requestsSent, requestsSuccess, successRate, requestsFailed)
+	log.Printf("  Types: %d seeders (%.1f%%), %d leechers (%.1f%%)",
+		seedersSent, seederRate, leechersSent, 100-seederRate)
+	log.Printf("  Success rates: seeders %.1f%%, leechers %.1f%%",
+		seederSuccessRate, leecherSuccessRate)
 	log.Printf("  Average request time: %v", avgTime)
 	log.Printf("  Average peers per response: %.1f", avgPeers)
 }
