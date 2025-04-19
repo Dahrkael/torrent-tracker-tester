@@ -5,27 +5,32 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"net/http"
-	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/dahrkael/torrent-tracker-tester/internal/bittorrent"
 )
 
 // Configuration parameters for the application
 type Config struct {
 	// Number of concurrent goroutines to maintain
 	ConcurrentRequests int
-	// Tracker URL to send announce requests to
-	TrackerURL string
+	// HTTP Tracker URL to send announce requests to
+	HTTPTrackerURL string
+	// UDP Tracker URL to send announce requests to
+	UDPTrackerURL string
 	// Run duration (0 means run indefinitely)
 	Duration time.Duration
+	// Timeout for requests
+	RequestTimeout time.Duration
 	// Whether to print detailed logs
 	Verbose bool
 	// Size of the info_hash pool
 	InfoHashPoolSize int
-	// Size of the peer pool
-	PeerPoolSize int
+	// Size of the client pool
+	ClientPoolSize int
 	// Probability of generating a seeder request (0.0-1.0)
 	SeederProbability float64
 	// Parameters for announce requests
@@ -52,39 +57,11 @@ type RequestParams struct {
 	MinKeyLength, MaxKeyLength int
 }
 
-// AnnounceRequest represents a tracker announce request
-type AnnounceRequest struct {
-	InfoHash    string
-	PeerID      string
-	Port        int
-	Uploaded    int64
-	Downloaded  int64
-	Left        int64
-	Event       string
-	IP          string
-	NumWant     int
-	Key         string
-	TrackerID   string
-	Compact     int
-	NoPeerID    int
-	Supportcryp int
-	IsSeeder    bool // Flag to indicate if this is a seeder request
-}
-
-// PeerInfo represents a BitTorrent peer
-type PeerInfo struct {
-	ID   string
-	IP   string
-	Port int
-	Key  string
-}
-
 // AnnounceResult holds the result of an announce request
 type AnnounceResult struct {
 	Success      bool
 	RequestTime  time.Duration
 	PeersCount   int
-	HTTPStatus   int
 	ErrorMessage string
 	InfoHash     string
 	PeerID       string
@@ -96,11 +73,13 @@ var (
 	// Default configuration
 	defaultConfig = Config{
 		ConcurrentRequests: 1,
-		TrackerURL:         "http://localhost:6969/announce",
+		HTTPTrackerURL:     "",
+		UDPTrackerURL:      "",
 		Duration:           0,
+		RequestTimeout:     10 * time.Second,
 		Verbose:            true,
 		InfoHashPoolSize:   100,
-		PeerPoolSize:       50,
+		ClientPoolSize:     50,
 		SeederProbability:  0.3, // 30% seeders by default
 		RequestParams: RequestParams{
 			MinPort:       6881,
@@ -137,7 +116,7 @@ var (
 
 	// Pools
 	infoHashPool []string
-	peerPool     []PeerInfo
+	clientPool   []bittorrent.ClientConfig
 )
 
 func main() {
@@ -151,11 +130,21 @@ func main() {
 		log.SetFlags(0)
 	}
 
+	if config.HTTPTrackerURL == "" && config.UDPTrackerURL == "" {
+		fmt.Fprintf(os.Stderr, "No defined target trackers")
+		os.Exit(1)
+	}
+
 	log.Printf("Starting BitTorrent tracker announcer")
-	log.Printf("Target tracker: %s", config.TrackerURL)
+	if config.HTTPTrackerURL != "" {
+		log.Printf("HTTP Target tracker: %s", config.HTTPTrackerURL)
+	}
+	if config.UDPTrackerURL != "" {
+		log.Printf("UDP Target tracker: %s", config.UDPTrackerURL)
+	}
 	log.Printf("Concurrent requests: %d", config.ConcurrentRequests)
 	log.Printf("Info hash pool size: %d", config.InfoHashPoolSize)
-	log.Printf("Peer pool size: %d", config.PeerPoolSize)
+	log.Printf("Peer pool size: %d", config.ClientPoolSize)
 	log.Printf("Seeder probability: %.2f (%.1f%%)", config.SeederProbability, config.SeederProbability*100)
 	if config.Duration > 0 {
 		log.Printf("Running for: %s", config.Duration)
@@ -165,10 +154,10 @@ func main() {
 
 	// Generate pools
 	generateInfoHashPool(config.InfoHashPoolSize)
-	generatePeerPool(config.PeerPoolSize, config.RequestParams)
+	generateClientPool(config.ClientPoolSize, config.RequestParams)
 
 	log.Printf("Generated %d unique info_hashes", len(infoHashPool))
-	log.Printf("Generated %d unique peers", len(peerPool))
+	log.Printf("Generated %d unique peers", len(clientPool))
 
 	// Channel for results
 	resultsChan := make(chan AnnounceResult, config.ConcurrentRequests*2)
@@ -230,15 +219,16 @@ func generateInfoHashPool(size int) {
 	}
 }
 
-// generatePeerPool creates a pool of random peers
-func generatePeerPool(size int, params RequestParams) {
-	peerPool = make([]PeerInfo, size)
+// generateClientPool creates a pool of random peers
+func generateClientPool(size int, params RequestParams) {
+	clientPool = make([]bittorrent.ClientConfig, size)
 	for i := 0; i < size; i++ {
-		peerPool[i] = PeerInfo{
-			ID:   generateRandomPeerID(),
-			IP:   params.IPRange[rng.Intn(len(params.IPRange))],
-			Port: rng.Intn(params.MaxPort-params.MinPort+1) + params.MinPort,
-			Key:  generateRandomKey(params.MinKeyLength, params.MaxKeyLength),
+		clientPool[i] = bittorrent.ClientConfig{
+			PeerID: generateRandomPeerID(),
+			Address: bittorrent.Peer{
+				IP:   generateRandomIPv4(),
+				Port: rng.Intn(params.MaxPort-params.MinPort+1) + params.MinPort,
+			},
 		}
 	}
 }
@@ -249,11 +239,12 @@ func parseFlags() Config {
 
 	// Define command line flags
 	flag.IntVar(&config.ConcurrentRequests, "concurrent", defaultConfig.ConcurrentRequests, "Number of concurrent requests")
-	flag.StringVar(&config.TrackerURL, "tracker", defaultConfig.TrackerURL, "Tracker URL")
+	flag.StringVar(&config.HTTPTrackerURL, "http-tracker", defaultConfig.HTTPTrackerURL, "HTTP Tracker URL")
+	flag.StringVar(&config.UDPTrackerURL, "udp-tracker", defaultConfig.UDPTrackerURL, "UDP Tracker URL")
 	durationStr := flag.String("duration", "", "Duration to run (e.g., 1m, 1h, 30s)")
 	flag.BoolVar(&config.Verbose, "verbose", defaultConfig.Verbose, "Verbose output")
 	flag.IntVar(&config.InfoHashPoolSize, "hashpool", defaultConfig.InfoHashPoolSize, "Size of the info_hash pool")
-	flag.IntVar(&config.PeerPoolSize, "peerpool", defaultConfig.PeerPoolSize, "Size of the peer pool")
+	flag.IntVar(&config.ClientPoolSize, "clientpool", defaultConfig.ClientPoolSize, "Size of the peer pool")
 	flag.Float64Var(&config.SeederProbability, "seeders", defaultConfig.SeederProbability, "Probability of generating seeder requests (0.0-1.0)")
 
 	// Parse flags
@@ -282,186 +273,80 @@ func parseFlags() Config {
 func makeAnnounceRequest(config Config, results chan<- AnnounceResult, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	// Generate a random announce request using pools, considering seeder probability
-	req := generateAnnounceRequestFromPools(config.RequestParams, config.SeederProbability)
+	var trackerUrls []string
+	if config.HTTPTrackerURL != "" {
+		trackerUrls = append(trackerUrls, config.HTTPTrackerURL)
+	}
+	if config.UDPTrackerURL != "" {
+		trackerUrls = append(trackerUrls, config.UDPTrackerURL)
+	}
 
-	// Build the request URL
-	reqURL, err := buildAnnounceURL(config.TrackerURL, req)
-	if err != nil {
-		results <- AnnounceResult{
-			Success:      false,
-			RequestTime:  0,
-			PeersCount:   0,
-			HTTPStatus:   0,
-			ErrorMessage: fmt.Sprintf("Failed to build URL: %v", err),
-			InfoHash:     req.InfoHash,
-			PeerID:       req.PeerID,
-			IsSeeder:     req.IsSeeder,
+	trackerUrl := trackerUrls[rng.Int()%len(trackerUrls)]
+
+	// Determine if this request should be a seeder based on probability
+	isSeeder := rng.Float64() < config.SeederProbability
+
+	// Select a random info_hash from the pool
+	infoHash := infoHashPool[rng.Intn(len(infoHashPool))]
+
+	// Select a random client from the pool
+	client := clientPool[rng.Intn(len(clientPool))]
+
+	// Transfer statistics for the announce request
+	var stats bittorrent.TransferStats
+	if isSeeder {
+		// Seeders have left=0, usually no event, and potentially high upload values
+		stats = bittorrent.TransferStats{
+			Uploaded:   randomInt64(config.RequestParams.MinUploaded, config.RequestParams.MaxUploaded) * 2,   // Typically higher uploads for seeders
+			Downloaded: randomInt64(config.RequestParams.MaxDownloaded/2, config.RequestParams.MaxDownloaded), // Downloaded is usually high (completed)
+			Left:       0,                                                                                     // Estimated total size remaining
 		}
-		return
+	} else {
+		// Leechers have non-zero left and various events
+		stats = bittorrent.TransferStats{
+			Uploaded:   randomInt64(config.RequestParams.MinUploaded, config.RequestParams.MaxUploaded),     // No bytes uploaded yet
+			Downloaded: randomInt64(config.RequestParams.MinDownloaded, config.RequestParams.MaxDownloaded), // No bytes downloaded yet
+			Left:       randomInt64(config.RequestParams.MinLeft, config.RequestParams.MaxLeft),             // Estimated total size remaining
+		}
+		//event = params.Events[rng.Intn(len(params.Events))]
+	}
+
+	var err error
+
+	// Create the appropiate type of tracker to send the request to
+	tracker, err := createTracker(trackerUrl, client, config)
+	if err != nil {
 	}
 
 	// Log the request if verbose
 	if config.Verbose {
-		if req.IsSeeder {
-			log.Printf("Sending seeder request: %s", reqURL)
+		if isSeeder {
+			log.Printf("Sending seeder request to: %s", config.HTTPTrackerURL)
 		} else {
-			log.Printf("Sending leecher request: %s", reqURL)
+			log.Printf("Sending leecher request to: %s", config.HTTPTrackerURL)
 		}
 	}
 
-	// Send the HTTP request and measure time
+	errorMessage := ""
+	// Send the announcement and measure the time it takes to complete
 	startTime := time.Now()
-	response, err := http.Get(reqURL)
-	requestTime := time.Since(startTime)
-
-	// Process the response
+	peers, err := tracker.Announce(infoHash, stats)
 	if err != nil {
-		results <- AnnounceResult{
-			Success:      false,
-			RequestTime:  requestTime,
-			PeersCount:   0,
-			HTTPStatus:   0,
-			ErrorMessage: fmt.Sprintf("HTTP request failed: %v", err),
-			InfoHash:     req.InfoHash,
-			PeerID:       req.PeerID,
-			IsSeeder:     req.IsSeeder,
-		}
-		return
+		errorMessage = fmt.Sprintf("%v", err)
 	}
-	defer response.Body.Close()
+	requestTime := time.Since(startTime)
+	peersCount := len(peers)
 
-	// Check response status
-	if response.StatusCode != http.StatusOK {
-		results <- AnnounceResult{
-			Success:      false,
-			RequestTime:  requestTime,
-			PeersCount:   0,
-			HTTPStatus:   response.StatusCode,
-			ErrorMessage: fmt.Sprintf("Non-200 status code: %d", response.StatusCode),
-			InfoHash:     req.InfoHash,
-			PeerID:       req.PeerID,
-			IsSeeder:     req.IsSeeder,
-		}
-		return
-	}
-
-	// Parse the response
-	// In a real implementation, you would decode the bencode response here
-	// For simplicity, we're just assuming success and a random number of peers
-	peersCount := rng.Intn(50) + 1
-
-	// Return the result
+	// Process the response and return the result
 	results <- AnnounceResult{
-		Success:      true,
+		Success:      err == nil,
 		RequestTime:  requestTime,
 		PeersCount:   peersCount,
-		HTTPStatus:   response.StatusCode,
-		ErrorMessage: "",
-		InfoHash:     req.InfoHash,
-		PeerID:       req.PeerID,
-		IsSeeder:     req.IsSeeder,
+		ErrorMessage: errorMessage,
+		InfoHash:     infoHash,
+		PeerID:       client.PeerID,
+		IsSeeder:     isSeeder,
 	}
-}
-
-// generateAnnounceRequestFromPools creates an announce request using the predefined pools
-func generateAnnounceRequestFromPools(params RequestParams, seederProb float64) AnnounceRequest {
-	// Select a random info_hash from the pool
-	infoHash := infoHashPool[rng.Intn(len(infoHashPool))]
-
-	// Select a random peer from the pool
-	peer := peerPool[rng.Intn(len(peerPool))]
-
-	// Determine if this request should be a seeder based on probability
-	isSeeder := rng.Float64() < seederProb
-
-	var left int64
-	var event string
-	var uploaded int64
-	var downloaded int64
-
-	if isSeeder {
-		// Seeders have left=0, usually no event, and potentially high upload values
-		left = 0
-		event = ""                                                             // Seeders typically don't send events after initial announcement
-		uploaded = randomInt64(params.MinUploaded, params.MaxUploaded) * 2     // Typically higher uploads for seeders
-		downloaded = randomInt64(params.MaxDownloaded/2, params.MaxDownloaded) // Downloaded is usually high (completed)
-	} else {
-		// Leechers have non-zero left and various events
-		left = randomInt64(params.MinLeft, params.MaxLeft)
-		event = params.Events[rng.Intn(len(params.Events))]
-		uploaded = randomInt64(params.MinUploaded, params.MaxUploaded)
-		downloaded = randomInt64(params.MinDownloaded, params.MaxDownloaded)
-	}
-
-	return AnnounceRequest{
-		InfoHash:    infoHash,
-		PeerID:      peer.ID,
-		Port:        peer.Port,
-		Uploaded:    uploaded,
-		Downloaded:  downloaded,
-		Left:        left,
-		Event:       event,
-		IP:          peer.IP,
-		NumWant:     rng.Intn(params.MaxNumWant-params.MinNumWant+1) + params.MinNumWant,
-		Key:         peer.Key,
-		TrackerID:   "",
-		Compact:     1,
-		NoPeerID:    0,
-		Supportcryp: 0,
-		IsSeeder:    isSeeder,
-	}
-}
-
-// buildAnnounceURL builds the complete URL for the announce request
-func buildAnnounceURL(baseURL string, req AnnounceRequest) (string, error) {
-	u, err := url.Parse(baseURL)
-	if err != nil {
-		return "", err
-	}
-
-	// Add query parameters
-	q := u.Query()
-	q.Set("info_hash", req.InfoHash)
-	q.Set("peer_id", req.PeerID)
-	q.Set("port", fmt.Sprintf("%d", req.Port))
-	q.Set("uploaded", fmt.Sprintf("%d", req.Uploaded))
-	q.Set("downloaded", fmt.Sprintf("%d", req.Downloaded))
-	q.Set("left", fmt.Sprintf("%d", req.Left))
-
-	if req.Event != "" {
-		q.Set("event", req.Event)
-	}
-
-	if req.IP != "" {
-		q.Set("ip", req.IP)
-	}
-
-	q.Set("numwant", fmt.Sprintf("%d", req.NumWant))
-
-	if req.Key != "" {
-		q.Set("key", req.Key)
-	}
-
-	if req.TrackerID != "" {
-		q.Set("trackerid", req.TrackerID)
-	}
-
-	q.Set("compact", fmt.Sprintf("%d", req.Compact))
-
-	if req.NoPeerID != 0 {
-		q.Set("no_peer_id", fmt.Sprintf("%d", req.NoPeerID))
-	}
-
-	if req.Supportcryp != 0 {
-		q.Set("supportcryp", fmt.Sprintf("%d", req.Supportcryp))
-	}
-
-	u.RawQuery = q.Encode()
-
-	// Note: In a real implementation, you'd need to properly encode the info_hash and peer_id
-	// as they are raw 20-byte values, not URL-safe strings.
-	return u.String(), nil
 }
 
 // generateRandomInfoHash creates a random info_hash (20 bytes, URL encoded)
@@ -480,23 +365,36 @@ func generateRandomPeerID() string {
 	clientID := "GO"
 	version := "0001"
 
-	randomPart := make([]byte, 12)
+	randomPart := make([]byte, 6) // 12
 	rng.Read(randomPart)
 
 	return fmt.Sprintf("-%s%s-%x", clientID, version, randomPart)
 }
 
-// generateRandomKey creates a random key of the specified length
-func generateRandomKey(minLen, maxLen int) string {
-	length := rng.Intn(maxLen-minLen+1) + minLen
-	bytes := make([]byte, length)
-	rng.Read(bytes)
-	return fmt.Sprintf("%x", bytes)
+func generateRandomIPv4() string {
+	// Generate four random octets (0-255)
+	octet1 := rand.Intn(256)
+	octet2 := rand.Intn(256)
+	octet3 := rand.Intn(256)
+	octet4 := rand.Intn(256)
+
+	// Format the IPv4 address as a text string
+	return fmt.Sprintf("%d.%d.%d.%d", octet1, octet2, octet3, octet4)
 }
 
 // randomInt64 returns a random int64 in the specified range
 func randomInt64(min, max int64) int64 {
 	return min + rng.Int63n(max-min+1)
+}
+
+// createTracker creates a Tracker based on the URL type, configuration, and tracker URL.
+func createTracker(trackerURL string, client bittorrent.ClientConfig, config Config) (bittorrent.Tracker, error) {
+	if strings.HasPrefix(strings.ToLower(trackerURL), "http://") || strings.HasPrefix(strings.ToLower(trackerURL), "https://") {
+		return bittorrent.NewHTTPTracker(trackerURL, client, config.RequestTimeout), nil
+	} else if strings.HasPrefix(strings.ToLower(trackerURL), "udp://") {
+		return bittorrent.NewUDPTracker(trackerURL, client, config.RequestTimeout)
+	}
+	return nil, fmt.Errorf("unsupported protocol in URL: %s", trackerURL)
 }
 
 // processResult updates statistics based on the request result
