@@ -82,8 +82,8 @@ var (
 		ClientPoolSize:     50,
 		SeederProbability:  0.3, // 30% seeders by default
 		RequestParams: RequestParams{
-			MinPort:       6881,
-			MaxPort:       6889,
+			MinPort:       1,
+			MaxPort:       65535,
 			MinUploaded:   0,
 			MaxUploaded:   1073741824, // 1 GB
 			MinDownloaded: 0,
